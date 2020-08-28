@@ -1,0 +1,134 @@
+#!/bin/bash
+set -u
+
+usage() {
+    echo "${0/*\/} [-v] [--crl <CAFile>] <time-in-seconds-from-now> <server>:<port> [<server>:<port>] [<server>:<port>] [...]"
+}
+
+if [ $# -eq 0 ]; then
+    usage 1>&2 ;
+    exit 1;
+fi
+
+verbose=false
+if [ $1 == '-v' ]; then
+        verbose=true
+        shift;
+fi
+
+crlcheck=false
+if [ $1 == '--crl' ]; then
+        tmpdir=/var/tmp/$(whoami)/crls/
+        CAFile="$2"
+        if [ -f "$CAFile" ]; then
+                crlcheck=true
+        else
+                echo "No CAFile $CAFile avaible for CRL checks." >&2
+                exit 5
+        fi
+        shift;shift;
+fi
+
+if [ $# -lt 2 ]; then
+    usage 1>&2 ;
+    exit 2;
+fi
+
+warn=$1
+shift
+
+now=$(date +%s)
+certRE="-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+ORANGE='\033[0;33m'
+NC='\033[0m'
+
+declare -A timeoutcodes=(
+        ["1"]="port non-SSL/non-STARTTLS/closed"
+        ["124"]="port timeout"
+)
+
+# https://stackoverflow.com/a/18738897
+function find_matches {
+    MATCHES=()
+    local STR=$1 RE="($2)(.*)"
+    while [[ -n $STR && $STR =~ $RE ]]; do
+        MATCHES+=("${BASH_REMATCH[1]}")
+        STR=${BASH_REMATCH[2]}
+    done
+}
+
+returnval=0
+
+while (( $# )) ; do
+        server=${1%:*}
+        port=${1#*:}
+        opts=""
+        case $port in
+                443 )
+                        opts="-servername $server"
+                        ;;
+                25|587 )
+                        opts="-starttls smtp"
+                        ;;
+                389 )
+                        opts="-starttls ldap"
+                        ;;
+                143 )
+                        opts="-starttls imap"
+                        ;;
+                110 )
+                        opts="-starttls pop3"
+                        ;;
+        esac
+        shift
+        connectiontext=$(echo | timeout 5 openssl s_client -connect $server:$port $opts -showcerts 2>/dev/null)
+        connection=$?
+        if [[ $connection -eq 0 ]] ; then
+                find_matches "$connectiontext" "$certRE"
+                for cert in "${MATCHES[@]}"; do
+                        certnotafter=$(echo "$cert" | openssl x509 -noout -dates 2>/dev/null)
+                        certnotafter=$(date --date="${certnotafter##*notAfter=}" +%s)
+                        if [ "$cert" == "${MATCHES[0]}" ] ; then
+                                certtype="cert"
+
+                                if $crlcheck ; then
+                                        crl=$(echo "$cert" | openssl x509 -noout -ext crlDistributionPoints)
+                                        if [ -n "$crl" ]; then
+                                                crl=${crl##*URI:}
+                                                wget -qN  --directory-prefix=$tmpdir $crl
+                                                crl=$tmpdir${crl##*/}
+                                                openssl crl -inform DER -in $crl -outform PEM -out ${crl%crl}pem
+                                                crl=${crl%crl}pem
+                                                # https://raymii.org/s/articles/OpenSSL_manually_verify_a_certificate_against_a_CRL.html
+                                                crlcheck=$(openssl verify -crl_check -CAfile <(cat "$CAFile" <(printf '%s\n' "${MATCHES[@]}") $crl) <(echo "$cert"))
+                                                crlcheck=${crlcheck##*: }
+                                                if [[ "$crlcheck" != "OK" ]]; then
+                                                        echo -e "$RED$server:$port      $certtype       revoked$NC"
+                                                        returnval=$(( 3 > $returnval ? 3 : $returnval ))
+                                                        break
+                                                fi
+                                        fi
+                                fi
+                        else
+                                certtype="chain"
+                        fi
+                        #echo $(openssl verify -attime $(( $now + $warn )) <(echo "$cert"))
+                        if [ $(( $now + $warn )) -lt $certnotafter ]; then
+                                if $verbose; then
+                                        echo -e "$GREEN$server:$port    $certtype       $(date --date=@$certnotafter +%F.%T)$NC"
+                                fi
+                        else
+                                echo -e "$ORANGE$server:$port   $certtype       $(date --date=@$certnotafter +%F.%T)$NC"
+                                returnval=$(( 1 > $returnval ? 1 : $returnval ))
+                        fi
+                done
+        else
+                echo -e "$RED$server:$port      ${timeoutcodes[$connection]}$NC"
+                returnval=$(( 2 > $returnval ? 2 : $returnval ))
+        fi
+done
+
+exit $returnval
