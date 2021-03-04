@@ -2,7 +2,7 @@
 set -u
 
 usage() {
-    echo "${0/*\/} [-v] [--crl <CAFile>] <time-in-seconds-from-now> <server>:<port> [<server>:<port>] [<server>:<port>] [...]"
+    echo "${0/*\/} [-v] <time-in-seconds-from-now> <server>:<port> [<server>:<port>] [<server>:<port>] [...]"
 }
 
 if [ $# -eq 0 ]; then
@@ -16,19 +16,6 @@ if [ $1 == '-v' ]; then
         shift;
 fi
 
-crlcheck=false
-if [ $1 == '--crl' ]; then
-        tmpdir=/var/tmp/$(whoami)/crls/
-        CAFile="$2"
-        if [ -f "$CAFile" ]; then
-                crlcheck=true
-        else
-                echo "No CAFile $CAFile avaible for CRL checks." >&2
-                exit 5
-        fi
-        shift;shift;
-fi
-
 if [ $# -lt 2 ]; then
     usage 1>&2 ;
     exit 2;
@@ -38,12 +25,19 @@ warn=$1
 shift
 
 now=$(date +%s)
-certRE="-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----"
+certRE='-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----'
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-ORANGE='\033[0;33m'
-NC='\033[0m'
+if [[ $TERM == "xterm" ]] ; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        ORANGE='\033[0;33m'
+        NC='\033[0m'
+else
+        RED=''
+        GREEN=''
+        ORANGE=''
+        NC=''
+fi
 
 declare -A timeoutcodes=(
         ["1"]="port non-SSL/non-STARTTLS/closed"
@@ -93,29 +87,9 @@ while (( $# )) ; do
                         certnotafter=$(date --date="${certnotafter##*notAfter=}" +%s)
                         if [ "$cert" == "${MATCHES[0]}" ] ; then
                                 certtype="cert"
-
-                                if $crlcheck ; then
-                                        crl=$(echo "$cert" | openssl x509 -noout -ext crlDistributionPoints)
-                                        if [ -n "$crl" ]; then
-                                                crl=${crl##*URI:}
-                                                wget -qN  --directory-prefix=$tmpdir $crl
-                                                crl=$tmpdir${crl##*/}
-                                                openssl crl -inform DER -in $crl -outform PEM -out ${crl%crl}pem
-                                                crl=${crl%crl}pem
-                                                # https://raymii.org/s/articles/OpenSSL_manually_verify_a_certificate_against_a_CRL.html
-                                                crlcheck=$(openssl verify -crl_check -CAfile <(cat "$CAFile" <(printf '%s\n' "${MATCHES[@]}") $crl) <(echo "$cert"))
-                                                crlcheck=${crlcheck##*: }
-                                                if [[ "$crlcheck" != "OK" ]]; then
-                                                        echo -e "$RED$server:$port      $certtype       revoked$NC"
-                                                        returnval=$(( 3 > $returnval ? 3 : $returnval ))
-                                                        break
-                                                fi
-                                        fi
-                                fi
                         else
                                 certtype="chain"
                         fi
-                        #echo $(openssl verify -attime $(( $now + $warn )) <(echo "$cert"))
                         if [ $(( $now + $warn )) -lt $certnotafter ]; then
                                 if $verbose; then
                                         echo -e "$GREEN$server:$port    $certtype       $(date --date=@$certnotafter +%F.%T)$NC"
